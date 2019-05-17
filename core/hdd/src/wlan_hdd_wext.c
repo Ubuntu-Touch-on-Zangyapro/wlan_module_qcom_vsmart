@@ -52,6 +52,7 @@
 #include <wlan_hdd_wmm.h>
 #include "utils_api.h"
 #include "wlan_hdd_p2p.h"
+#include "wlan_hdd_request_manager.h"
 #ifdef FEATURE_WLAN_TDLS
 #include "wlan_hdd_tdls.h"
 #endif
@@ -3425,131 +3426,37 @@ static bool hdd_is_auth_type_rsn(eCsrAuthType authType)
 	return rsnType;
 }
 
+struct rssi_priv {
+	int8_t rssi;
+};
+
 /**
  * hdd_get_rssi_cb() - "Get RSSI" callback function
  * @rssi: Current RSSI of the station
- * @staId: ID of the station
- * @pContext: opaque context originally passed to SME.  HDD always passes
+ * @sta_id: ID of the station
+ * @context: opaque context originally passed to SME.  HDD always passes
  *	a &struct statsContext
  *
  * Return: None
  */
-static void hdd_get_rssi_cb(int8_t rssi, uint32_t staId, void *pContext)
+static void hdd_get_rssi_cb(int8_t rssi, uint32_t sta_id, void *context)
 {
-	struct statsContext *pStatsContext;
-	hdd_adapter_t *pAdapter;
-	hdd_station_ctx_t *pHddStaCtx;
+	struct hdd_request *request;
+	struct rssi_priv *priv;
 
-	if (NULL == pContext) {
-		hdd_err("Bad param");
+	hdd_info("%s: rssi [%d] sta_id [%d] context [%pK]\n",
+		 __func__, (int)rssi, (int)sta_id, context);
+
+	request = hdd_request_get(context);
+	if (!request) {
+		hdd_err("%s: Obsolete request", __func__);
 		return;
 	}
 
-	pStatsContext = pContext;
-	pAdapter = pStatsContext->pAdapter;
-
-	if (!pAdapter) {
-		hdd_err("Invalid pAdapter");
-		return;
-	}
-
-	pHddStaCtx = WLAN_HDD_GET_STATION_CTX_PTR(pAdapter);
-
-	/* update rssi only if its valid else return previous valid rssi */
-	if (rssi)
-		pAdapter->rssi = rssi;
-
-	/* for new connection there might be no valid previous RSSI
-	 * Do not keep hdd_get_rssi_snr_by_bssid under spin_lock
-	 * because it accesses scan cache in pMac which is mutex
-	 * protected
-	 */
-	if (!pAdapter->rssi)
-		hdd_get_rssi_snr_by_bssid(pAdapter,
-			pHddStaCtx->conn_info.bssId.bytes,
-			&pAdapter->rssi, NULL);
-
-
-	/* there is a race condition that exists between this callback
-	 * function and the caller since the caller could time out
-	 * either before or while this code is executing.  we use a
-	 * spinlock to serialize these actions
-	 */
-	spin_lock(&hdd_context_lock);
-
-	if (pStatsContext->magic != PEER_INFO_CONTEXT_MAGIC) {
-		/* the caller presumably timed out so there is nothing
-		 * we can do
-		 */
-		spin_unlock(&hdd_context_lock);
-		hdd_warn("Invalid context, magic [%08x]",
-				pStatsContext->magic);
-		return;
-	}
-
-	/* context is valid so caller is still waiting */
-
-	/* paranoia: invalidate the magic */
-	pStatsContext->magic = 0;
-	/* notify the caller */
-	complete(&pStatsContext->completion);
-
-	/* serialization is complete */
-	spin_unlock(&hdd_context_lock);
-}
-
-/**
- * hdd_get_snr_cb() - "Get SNR" callback function
- * @snr: Current SNR of the station
- * @staId: ID of the station
- * @pContext: opaque context originally passed to SME.  HDD always passes
- *	a &struct statsContext
- *
- * Return: None
- */
-static void hdd_get_snr_cb(int8_t snr, uint32_t staId, void *pContext)
-{
-	struct statsContext *pStatsContext;
-	hdd_adapter_t *pAdapter;
-
-	if (NULL == pContext) {
-		hdd_err("Bad param");
-		return;
-	}
-
-	pStatsContext = pContext;
-	pAdapter = pStatsContext->pAdapter;
-
-	/* there is a race condition that exists between this callback
-	 * function and the caller since the caller could time out
-	 * either before or while this code is executing.  we use a
-	 * spinlock to serialize these actions
-	 */
-	spin_lock(&hdd_context_lock);
-
-	if ((NULL == pAdapter) || (SNR_CONTEXT_MAGIC != pStatsContext->magic)) {
-		/* the caller presumably timed out so there is nothing
-		 * we can do
-		 */
-		spin_unlock(&hdd_context_lock);
-		hdd_warn("Invalid context, pAdapter [%pK] magic [%08x]",
-			 pAdapter, pStatsContext->magic);
-		return;
-	}
-
-	/* context is valid so caller is still waiting */
-
-	/* paranoia: invalidate the magic */
-	pStatsContext->magic = 0;
-
-	/* copy over the snr */
-	pAdapter->snr = snr;
-
-	/* notify the caller */
-	complete(&pStatsContext->completion);
-
-	/* serialization is complete */
-	spin_unlock(&hdd_context_lock);
+	priv = hdd_request_priv(request);
+	priv->rssi = rssi;
+	hdd_request_complete(request);
+	hdd_request_put(request);
 }
 
 /**
@@ -3561,11 +3468,17 @@ static void hdd_get_snr_cb(int8_t snr, uint32_t staId, void *pContext)
  */
 QDF_STATUS wlan_hdd_get_rssi(hdd_adapter_t *pAdapter, int8_t *rssi_value)
 {
-	static struct statsContext context;
 	hdd_context_t *pHddCtx;
 	hdd_station_ctx_t *pHddStaCtx;
 	QDF_STATUS hstatus;
-	unsigned long rc;
+	int ret;
+	void *cookie;
+	struct hdd_request *request;
+	struct rssi_priv *priv;
+	static const struct hdd_request_params params = {
+		.priv_size = sizeof(*priv),
+		.timeout_ms = WLAN_WAIT_TIME_STATS,
+	};
 
 	if (NULL == pAdapter) {
 		hdd_err("Invalid context, pAdapter");
@@ -3595,49 +3508,91 @@ QDF_STATUS wlan_hdd_get_rssi(hdd_adapter_t *pAdapter, int8_t *rssi_value)
 		return QDF_STATUS_SUCCESS;
 	}
 
-	init_completion(&context.completion);
-	context.pAdapter = pAdapter;
-	context.magic = PEER_INFO_CONTEXT_MAGIC;
+	request = hdd_request_alloc(&params);
+	if (!request) {
+		hdd_err("%s: Request allocation failure, return cached RSSI",
+			__func__);
+		*rssi_value = pAdapter->rssi;
+		return QDF_STATUS_SUCCESS;
+	}
+	cookie = hdd_request_cookie(request);
 
 	hstatus = sme_get_rssi(pHddCtx->hHal, hdd_get_rssi_cb,
 			       pHddStaCtx->conn_info.staId[0],
 			       pHddStaCtx->conn_info.bssId, pAdapter->rssi,
-			       &context, pHddCtx->pcds_context);
+			       cookie, pHddCtx->pcds_context);
 	if (QDF_STATUS_SUCCESS != hstatus) {
 		hdd_err("Unable to retrieve RSSI");
 		/* we'll returned a cached value below */
 	} else {
 		/* request was sent -- wait for the response */
-		rc = wait_for_completion_timeout(&context.completion,
-						 msecs_to_jiffies
-							 (WLAN_WAIT_TIME_STATS));
-		if (!rc) {
-			hdd_err("SME timed out while retrieving RSSI");
-			/* we'll now returned a cached value below */
+		ret = hdd_request_wait_for_response(request);
+		if (ret) {
+			hdd_warn("SME timed out while retrieving RSSI");
+			/* we'll returned a cached value below */
+		} else {
+			/* update the adapter with the fresh results */
+			priv = hdd_request_priv(request);
+
+			pAdapter->rssi = priv->rssi;
+
+			/*
+			 * for new connection there might be no valid previous
+			 * RSSI.
+			 */
+			if (!pAdapter->rssi) {
+				hdd_get_rssi_snr_by_bssid(pAdapter,
+					pHddStaCtx->conn_info.bssId.bytes,
+					&pAdapter->rssi, NULL);
+			}
 		}
 	}
 
-	/* either we never sent a request, we sent a request and
-	 * received a response or we sent a request and timed out.  if
-	 * we never sent a request or if we sent a request and got a
-	 * response, we want to clear the magic out of paranoia.  if
-	 * we timed out there is a race condition such that the
-	 * callback function could be executing at the same time we
-	 * are. of primary concern is if the callback function had
-	 * already verified the "magic" but had not yet set the
-	 * completion variable when a timeout occurred. we serialize
-	 * these activities by invalidating the magic while holding a
-	 * shared spinlock which will cause us to block if the
-	 * callback is currently executing
+	/*
+	 * either we never sent a request, we sent a request and
+	 * received a response or we sent a request and timed out.
+	 * regardless we are done with the request.
 	 */
-	spin_lock(&hdd_context_lock);
-	context.magic = 0;
-	spin_unlock(&hdd_context_lock);
+	hdd_request_put(request);
 
 	*rssi_value = pAdapter->rssi;
 	hdd_debug("RSSI = %d", *rssi_value);
 
 	return QDF_STATUS_SUCCESS;
+}
+
+struct snr_priv {
+	int8_t snr;
+};
+
+/**
+ * hdd_get_snr_cb() - "Get SNR" callback function
+ * @snr: Current SNR of the station
+ * @sta_id: ID of the station
+ * @context: opaque context originally passed to SME.  HDD always passes
+ *	     a cookie for the request context
+ *
+ * Return: None
+ */
+static void hdd_get_snr_cb(int8_t snr, uint32_t sta_id, void *context)
+{
+	struct hdd_request *request;
+	struct snr_priv *priv;
+
+	hdd_info("%s: snr [%d] sta_id [%d] context [%pK]\n",
+		 __func__, (int)snr, (int)sta_id, context);
+
+	request = hdd_request_get(context);
+	if (!request) {
+		hdd_err("%s: Obsolete request", __func__);
+		return;
+	}
+
+	/* propagate response back to requesting thread */
+	priv = hdd_request_priv(request);
+	priv->snr = snr;
+	hdd_request_complete(request);
+	hdd_request_put(request);
 }
 
 /**
@@ -3649,12 +3604,18 @@ QDF_STATUS wlan_hdd_get_rssi(hdd_adapter_t *pAdapter, int8_t *rssi_value)
  */
 QDF_STATUS wlan_hdd_get_snr(hdd_adapter_t *pAdapter, int8_t *snr)
 {
-	static struct statsContext context;
 	hdd_context_t *pHddCtx;
 	hdd_station_ctx_t *pHddStaCtx;
 	QDF_STATUS hstatus;
-	unsigned long rc;
 	int valid;
+	int ret;
+	void *cookie;
+	struct hdd_request *request;
+	struct snr_priv *priv;
+	static const struct hdd_request_params params = {
+		.priv_size = sizeof(*priv),
+		.timeout_ms = WLAN_WAIT_TIME_STATS,
+	};
 
 	ENTER();
 
@@ -3671,182 +3632,130 @@ QDF_STATUS wlan_hdd_get_snr(hdd_adapter_t *pAdapter, int8_t *snr)
 
 	pHddStaCtx = WLAN_HDD_GET_STATION_CTX_PTR(pAdapter);
 
-	init_completion(&context.completion);
-	context.pAdapter = pAdapter;
-	context.magic = SNR_CONTEXT_MAGIC;
+	request = hdd_request_alloc(&params);
+	if (!request) {
+		hdd_err("%s: Request allocation failure", __func__);
+		return QDF_STATUS_E_FAULT;
+	}
+	cookie = hdd_request_cookie(request);
 
 	hstatus = sme_get_snr(pHddCtx->hHal, hdd_get_snr_cb,
 			      pHddStaCtx->conn_info.staId[0],
-			      pHddStaCtx->conn_info.bssId, &context);
+			      pHddStaCtx->conn_info.bssId, cookie);
 	if (QDF_STATUS_SUCCESS != hstatus) {
 		hdd_err("Unable to retrieve RSSI");
 		/* we'll returned a cached value below */
 	} else {
 		/* request was sent -- wait for the response */
-		rc = wait_for_completion_timeout(&context.completion,
-						 msecs_to_jiffies
-							 (WLAN_WAIT_TIME_STATS));
-		if (!rc) {
+		ret = hdd_request_wait_for_response(request);
+		if (ret) {
 			hdd_err("SME timed out while retrieving SNR");
 			/* we'll now returned a cached value below */
+		} else {
+			/* update the adapter with the fresh results */
+			priv = hdd_request_priv(request);
+			pAdapter->snr = priv->snr;
 		}
 	}
 
-	/* either we never sent a request, we sent a request and
-	 * received a response or we sent a request and timed out.  if
-	 * we never sent a request or if we sent a request and got a
-	 * response, we want to clear the magic out of paranoia.  if
-	 * we timed out there is a race condition such that the
-	 * callback function could be executing at the same time we
-	 * are. of primary concern is if the callback function had
-	 * already verified the "magic" but had not yet set the
-	 * completion variable when a timeout occurred. we serialize
-	 * these activities by invalidating the magic while holding a
-	 * shared spinlock which will cause us to block if the
-	 * callback is currently executing
+	/*
+	 * either we never sent a request, we sent a request and
+	 * received a response or we sent a request and timed out.
+	 * regardless we are done with the request.
 	 */
-	spin_lock(&hdd_context_lock);
-	context.magic = 0;
-	spin_unlock(&hdd_context_lock);
+	hdd_request_put(request);
 
 	*snr = pAdapter->snr;
 	EXIT();
 	return QDF_STATUS_SUCCESS;
 }
 
-/**
- * hdd_get_link_speed_cb() - Get link speed callback function
- * @pLinkSpeed: pointer to the link speed record
- * @pContext: pointer to the user context passed to SME
- *
- * This function is passed as the callback function to
- * sme_get_link_speed() by wlan_hdd_get_linkspeed_for_peermac().  By
- * agreement a &struct linkspeedContext is passed as @pContext.  If
- * the context is valid, then the contents of @pLinkSpeed are copied
- * into the adapter record referenced by @pContext where they can be
- * subsequently retrieved.  If the context is invalid, then this
- * function does nothing since it is assumed the caller has already
- * timed-out and destroyed the context.
- *
- * Return: None.
- */
+struct linkspeed_priv {
+	tSirLinkSpeedInfo linkspeed_info;
+};
+
 static void
-hdd_get_link_speed_cb(tSirLinkSpeedInfo *pLinkSpeed, void *pContext)
+hdd_get_link_speed_cb(tSirLinkSpeedInfo *linkspeed_info, void *context)
 {
-	struct linkspeedContext *pLinkSpeedContext;
-	hdd_adapter_t *pAdapter;
+	struct hdd_request *request;
+	struct linkspeed_priv *priv;
 
-	if ((NULL == pLinkSpeed) || (NULL == pContext)) {
-		hdd_err("Bad param, pLinkSpeed [%pK] pContext [%pK]",
-			pLinkSpeed, pContext);
-		return;
-	}
-	spin_lock(&hdd_context_lock);
-	pLinkSpeedContext = pContext;
-	pAdapter = pLinkSpeedContext->pAdapter;
-
-	/* there is a race condition that exists between this callback
-	 * function and the caller since the caller could time out either
-	 * before or while this code is executing.  we use a spinlock to
-	 * serialize these actions
-	 */
-
-	if ((NULL == pAdapter) ||
-	    (LINK_CONTEXT_MAGIC != pLinkSpeedContext->magic)) {
-		/* the caller presumably timed out so there is nothing
-		 * we can do
-		 */
-		spin_unlock(&hdd_context_lock);
-		hdd_warn("Invalid context, pAdapter [%pK] magic [%08x]",
-			 pAdapter, pLinkSpeedContext->magic);
+	if (!linkspeed_info) {
+		hdd_err("NULL linkspeed");
 		return;
 	}
 
-	/* context is valid so caller is still waiting */
+	request = hdd_request_get(context);
+	if (!request) {
+		hdd_err("Obsolete request");
+		return;
+	}
 
-	/* paranoia: invalidate the magic */
-	pLinkSpeedContext->magic = 0;
-
-	/* copy over the stats. do so as a struct copy */
-	pAdapter->ls_stats = *pLinkSpeed;
-
-	/* notify the caller */
-	complete(&pLinkSpeedContext->completion);
-
-	/* serialization is complete */
-	spin_unlock(&hdd_context_lock);
+	priv = hdd_request_priv(request);
+	priv->linkspeed_info = *linkspeed_info;
+	hdd_request_complete(request);
+	hdd_request_put(request);
 }
 
-/**
- * wlan_hdd_get_linkspeed_for_peermac() - Get link speed for a peer
- * @pAdapter: adapter upon which the peer is active
- * @macAddress: MAC address of the peer
- *
- * This function will send a query to SME for the linkspeed of the
- * given peer, and then wait for the callback to be invoked.
- *
- * Return: Errno
- */
-int wlan_hdd_get_linkspeed_for_peermac(hdd_adapter_t *pAdapter,
-				       struct qdf_mac_addr macAddress)
+int wlan_hdd_get_linkspeed_for_peermac(hdd_adapter_t *adapter,
+				       struct qdf_mac_addr *mac_address,
+				       uint32_t *linkspeed)
 {
+	int ret;
 	QDF_STATUS status;
-	int errno;
-	unsigned long rc;
-	static struct linkspeedContext context;
-	tSirLinkSpeedInfo *linkspeed_req;
+	void *cookie;
+	tSirLinkSpeedInfo *linkspeed_info;
+	struct hdd_request *request;
+	struct linkspeed_priv *priv;
+	static const struct hdd_request_params params = {
+		.priv_size = sizeof(*priv),
+		.timeout_ms = WLAN_WAIT_TIME_STATS,
+	};
 
-	if (NULL == pAdapter) {
-		hdd_err("pAdapter is NULL");
+	if ((!adapter) || (!linkspeed)) {
+		hdd_err("NULL argument");
 		return -EINVAL;
 	}
 
-	linkspeed_req = qdf_mem_malloc(sizeof(*linkspeed_req));
-	if (NULL == linkspeed_req) {
-		hdd_err("Request Buffer Alloc Fail");
-		return -ENOMEM;
+	request = hdd_request_alloc(&params);
+	if (!request) {
+		hdd_err("Request allocation failure");
+		ret = -ENOMEM;
+		goto return_cached_value;
 	}
 
-	init_completion(&context.completion);
-	context.pAdapter = pAdapter;
-	context.magic = LINK_CONTEXT_MAGIC;
+	cookie = hdd_request_cookie(request);
+	priv = hdd_request_priv(request);
 
-	qdf_copy_macaddr(&linkspeed_req->peer_macaddr, &macAddress);
-	status = sme_get_link_speed(WLAN_HDD_GET_HAL_CTX(pAdapter),
-				    linkspeed_req,
-				    &context, hdd_get_link_speed_cb);
-	qdf_mem_free(linkspeed_req);
-	errno = qdf_status_to_os_return(status);
-	if (errno) {
+	linkspeed_info = &priv->linkspeed_info;
+	qdf_copy_macaddr(&linkspeed_info->peer_macaddr, mac_address);
+	status = sme_get_link_speed(WLAN_HDD_GET_HAL_CTX(adapter),
+				    linkspeed_info,
+				    cookie, hdd_get_link_speed_cb);
+	if (QDF_IS_STATUS_ERROR(status)) {
 		hdd_err("Unable to retrieve statistics for link speed");
-	} else {
-		rc = wait_for_completion_timeout
-			(&context.completion,
-			 msecs_to_jiffies(WLAN_WAIT_TIME_STATS));
-		if (!rc) {
-			hdd_err("SME timed out while retrieving link speed");
-			errno = -ETIMEDOUT;
-		}
+		ret = qdf_status_to_os_return(status);
+		goto cleanup;
 	}
+	ret = hdd_request_wait_for_response(request);
+	if (ret) {
+		hdd_err("SME timed out while retrieving link speed");
+		goto cleanup;
+	}
+	adapter->estimated_linkspeed = linkspeed_info->estLinkSpeed;
 
-	/* either we never sent a request, we sent a request and
-	 * received a response or we sent a request and timed out.  if
-	 * we never sent a request or if we sent a request and got a
-	 * response, we want to clear the magic out of paranoia.  if
-	 * we timed out there is a race condition such that the
-	 * callback function could be executing at the same time we
-	 * are. of primary concern is if the callback function had
-	 * already verified the "magic" but had not yet set the
-	 * completion variable when a timeout occurred. we serialize
-	 * these activities by invalidating the magic while holding a
-	 * shared spinlock which will cause us to block if the
-	 * callback is currently executing
+cleanup:
+	/*
+	 * either we never sent a request, we sent a request and
+	 * received a response or we sent a request and timed out.
+	 * regardless we are done with the request.
 	 */
-	spin_lock(&hdd_context_lock);
-	context.magic = 0;
-	spin_unlock(&hdd_context_lock);
+	hdd_request_put(request);
 
-	return errno;
+return_cached_value:
+	*linkspeed = adapter->estimated_linkspeed;
+
+	return ret;
 }
 
 /**
@@ -3887,18 +3796,22 @@ int wlan_hdd_get_link_speed(hdd_adapter_t *sta_adapter, uint32_t *link_speed)
 
 		qdf_copy_macaddr(&bssid, &hdd_stactx->conn_info.bssId);
 
-		errno = wlan_hdd_get_linkspeed_for_peermac(sta_adapter, bssid);
+		errno = wlan_hdd_get_linkspeed_for_peermac(sta_adapter, &bssid,
+							   link_speed);
 		if (errno) {
 			hdd_err("Unable to retrieve SME linkspeed: %d", errno);
 			return errno;
 		}
-		*link_speed = sta_adapter->ls_stats.estLinkSpeed;
 		/* linkspeed in units of 500 kbps */
 		*link_speed = (*link_speed) / 500;
 	}
 
 	return 0;
 }
+
+struct peer_rssi_priv {
+	struct sir_peer_sta_info peer_sta_info;
+};
 
 /**
  * hdd_get_peer_rssi_cb() - get peer station's rssi callback
@@ -3912,58 +3825,41 @@ int wlan_hdd_get_link_speed(hdd_adapter_t *sta_adapter, uint32_t *link_speed)
 static void hdd_get_peer_rssi_cb(struct sir_peer_info_resp *sta_rssi,
 							void *context)
 {
-	struct statsContext *get_rssi_context;
+	struct hdd_request *request;
 	struct sir_peer_info *rssi_info;
+	struct peer_rssi_priv *priv;
 	uint8_t peer_num;
-	hdd_adapter_t *padapter;
 
-	if ((sta_rssi == NULL) || (context == NULL)) {
-		hdd_err("Bad param, sta_rssi [%pK] context [%pK]",
-			sta_rssi, context);
+	if (sta_rssi == NULL) {
+		hdd_err("Bad param, sta_rssi [%pK]", sta_rssi);
 		return;
 	}
 
-	spin_lock(&hdd_context_lock);
-	/*
-	 * there is a race condition that exists between this callback
-	 * function and the caller since the caller could time out either
-	 * before or while this code is executing.  we use a spinlock to
-	 * serialize these actions
-	 */
-	get_rssi_context = (struct statsContext *)context;
-	padapter = get_rssi_context->pAdapter;
-	if (get_rssi_context->magic != PEER_INFO_CONTEXT_MAGIC ||
-	    !padapter) {
-		/*
-		 * the caller presumably timed out so there is nothing
-		 * we can do
-		 */
-		spin_unlock(&hdd_context_lock);
-		hdd_warn("Invalid context, magic [%08x], adapter [%pK]",
-			get_rssi_context->magic, padapter);
+	request = hdd_request_get(context);
+	if (!request) {
+		hdd_err("Obsolete request.");
 		return;
 	}
+
+	priv = hdd_request_priv(request);
 
 	peer_num = sta_rssi->count;
 	rssi_info = sta_rssi->info;
-	get_rssi_context->magic = 0;
 
 	hdd_debug("%d peers", peer_num);
 
 	if (peer_num > MAX_PEER_STA) {
-		hdd_warn("Exceed max peer sta to handle one time %d", peer_num);
+		hdd_warn("Exceed max peer sta to handle one time %d",
+			 peer_num);
 		peer_num = MAX_PEER_STA;
 	}
 
-	qdf_mem_copy(padapter->peer_sta_info.info, rssi_info,
-		peer_num * sizeof(*rssi_info));
-	padapter->peer_sta_info.sta_num = peer_num;
+	qdf_mem_copy(priv->peer_sta_info.info, rssi_info,
+		     peer_num * sizeof(*rssi_info));
+	priv->peer_sta_info.sta_num = peer_num;
 
-	/* notify the caller */
-	complete(&get_rssi_context->completion);
-
-	/* serialization is complete */
-	spin_unlock(&hdd_context_lock);
+	hdd_request_complete(request);
+	hdd_request_put(request);
 }
 
 int wlan_hdd_get_peer_rssi(hdd_adapter_t *adapter,
@@ -3971,62 +3867,55 @@ int wlan_hdd_get_peer_rssi(hdd_adapter_t *adapter,
 			   int request_source)
 {
 	QDF_STATUS status;
+	void *cookie;
 	int ret;
-	static struct statsContext context;
 	struct sir_peer_info_req rssi_req;
+	struct hdd_request *request;
+	struct peer_rssi_priv *priv;
+	static const struct hdd_request_params params = {
+		.priv_size = sizeof(*priv),
+		.timeout_ms = WLAN_WAIT_TIME_STATS,
+	};
 
 	if (!adapter || !macaddress) {
-		hdd_err("pAdapter [%pK], macaddress [%pK]", adapter, macaddress);
+		hdd_err("adapter [%pK], macaddress [%pK]",
+			adapter, macaddress);
 		return -EFAULT;
 	}
 
-	init_completion(&context.completion);
-	context.magic = PEER_INFO_CONTEXT_MAGIC;
-	context.pAdapter = adapter;
+	request = hdd_request_alloc(&params);
+	if (!request) {
+		hdd_err("Request allocation failure");
+		return -ENOMEM;
+	}
+
+	cookie = hdd_request_cookie(request);
 
 	qdf_mem_copy(&(rssi_req.peer_macaddr), macaddress,
-				QDF_MAC_ADDR_SIZE);
+		     QDF_MAC_ADDR_SIZE);
 	rssi_req.sessionid = adapter->sessionId;
 	status = sme_get_peer_info(WLAN_HDD_GET_HAL_CTX(adapter),
-				rssi_req,
-				&context,
-				hdd_get_peer_rssi_cb);
+				   rssi_req,
+				   cookie,
+				   hdd_get_peer_rssi_cb);
 	if (status != QDF_STATUS_SUCCESS) {
 		hdd_err("Unable to retrieve statistics for rssi");
 		ret = -EFAULT;
-	}
-
-	else if (request_source != HDD_WLAN_GET_PEER_RSSI_SOURCE_DRIVER) {
-		if (!wait_for_completion_timeout(&context.completion,
-				msecs_to_jiffies(WLAN_WAIT_TIME_STATS))) {
+	} else if (request_source != HDD_WLAN_GET_PEER_RSSI_SOURCE_DRIVER) {
+		ret = hdd_request_wait_for_response(request);
+		if (ret) {
 			hdd_err("SME timed out while retrieving rssi");
 			ret = -EFAULT;
 		} else {
+			priv = hdd_request_priv(request);
+			adapter->peer_sta_info = priv->peer_sta_info;
 			ret = 0;
 		}
-		goto set_magic;
 	} else {
 		ret = 0;
-		return ret;
 	}
-set_magic:
-	/*
-	 * either we never sent a request, we sent a request and received a
-	 * response or we sent a request and timed out.  if we never sent a
-	 * request or if we sent a request and got a response, we want to
-	 * clear the magic out of paranoia.  if we timed out there is a
-	 * race condition such that the callback function could be
-	 * executing at the same time we are. of primary concern is if the
-	 * callback function had already verified the "magic" but had not
-	 * yet set the completion variable when a timeout occurred. we
-	 * serialize these activities by invalidating the magic while
-	 * holding a shared spinlock which will cause us to block if the
-	 * callback is currently executing
-	 */
 
-	spin_lock(&hdd_context_lock);
-	context.magic = 0;
-	spin_unlock(&hdd_context_lock);
+	hdd_request_put(request);
 
 	return ret;
 }
